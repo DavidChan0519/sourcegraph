@@ -1,12 +1,15 @@
 package server
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/gorilla/mux"
@@ -127,18 +130,103 @@ func (s *Server) handlePostDatabasePart(w http.ResponseWriter, r *http.Request) 
 func (s *Server) handlePostDatabaseStitch(w http.ResponseWriter, r *http.Request) {
 	id := idFromRequest(r)
 	filename := paths.DBFilename(s.bundleDir, id)
+	tmpFilename := filename + ".tmp"
 	makePartFilename := func(index int) string {
 		return paths.DBPartFilename(s.bundleDir, id, int64(index))
 	}
 
-	if err := codeintelutils.StitchFiles(filename, makePartFilename, false); err != nil {
+	if err := codeintelutils.StitchFiles(tmpFilename, makePartFilename, false); err != nil {
 		log15.Error("Failed to stitch multipart database", "err", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
+	if err := os.Mkdir(filename, os.ModePerm); err != nil {
+		panic(err.Error())
+	}
+
+	f, err := os.Open(tmpFilename)
+	if err != nil {
+		panic(err.Error())
+	}
+	defer f.Close()
+	// TODO - delete file
+
+	fmt.Printf("Untarring %s -> %s", tmpFilename, filename)
+
+	if err := Untar(filename, f); err != nil {
+		panic(err.Error())
+	}
+
 	// Once we have a database, we no longer need the upload file
 	s.deleteUpload(w, r)
+}
+
+// Untar takes a destination path and a reader; a tar reader loops over the tarfile
+// creating the file structure at 'dst' along the way, and writing any files
+func Untar(dst string, r io.Reader) error {
+
+	gzr, err := gzip.NewReader(r)
+	if err != nil {
+		return err
+	}
+	defer gzr.Close()
+
+	tr := tar.NewReader(gzr)
+
+	for {
+		header, err := tr.Next()
+
+		switch {
+
+		// if no more files are found return
+		case err == io.EOF:
+			return nil
+
+		// return any other error
+		case err != nil:
+			return err
+
+		// if the header is nil, just skip it (not sure how this happens)
+		case header == nil:
+			continue
+		}
+
+		// the target location where the dir/file should be created
+		target := filepath.Join(dst, header.Name)
+
+		// the following switch could also be done using fi.Mode(), not sure if there
+		// a benefit of using one vs. the other.
+		// fi := header.FileInfo()
+
+		// check the file type
+		switch header.Typeflag {
+
+		// if its a dir and it doesn't exist create it
+		case tar.TypeDir:
+			if _, err := os.Stat(target); err != nil {
+				if err := os.MkdirAll(target, 0755); err != nil {
+					return err
+				}
+			}
+
+		// if it's a file create it
+		case tar.TypeReg:
+			f, err := os.OpenFile(target, os.O_CREATE|os.O_RDWR, os.FileMode(header.Mode))
+			if err != nil {
+				return err
+			}
+
+			// copy over contents
+			if _, err := io.Copy(f, tr); err != nil {
+				return err
+			}
+
+			// manually close here after each file operation; defering would cause each file close
+			// to wait until all operations have completed.
+			f.Close()
+		}
+	}
 }
 
 // GET /dbs/{id:[0-9]+}/exists
@@ -340,7 +428,7 @@ func (s *Server) dbQueryErr(w http.ResponseWriter, r *http.Request, handler dbQu
 			return nil, ErrUnknownDatabase
 		}
 
-		sqliteReader, err := reader.NewSQLiteReader(filename, jsonserializer.New())
+		sqliteReader, err := reader.NewBadgerReader(filename, jsonserializer.New())
 		if err != nil {
 			return nil, pkgerrors.Wrap(err, "reader.NewSQLiteReader")
 		}

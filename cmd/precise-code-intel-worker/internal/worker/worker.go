@@ -1,14 +1,18 @@
 package worker
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"context"
+	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/hashicorp/go-multierror"
 	"github.com/inconshreveable/log15"
 	"github.com/pkg/errors"
@@ -147,19 +151,12 @@ func (p *processor) Process(ctx context.Context, tx db.DB, upload db.Upload) (er
 		}
 	}()
 
-	// Create target file for converted database
-	uuid, err := uuid.NewRandom()
-	if err != nil {
-		return err
-	}
-	newFilename := filepath.Join(name, uuid.String())
-
 	// Read raw upload and write converted database to newFilename. This process also correlates
 	// and returns the  data we need to insert into Postgres to support cross-dump/repo queries.
 	packages, packageReferences, err := convert(
 		ctx,
 		filename,
-		newFilename,
+		name,
 		upload.ID,
 		upload.Root,
 		func(dirnames []string) (map[string][]string, error) {
@@ -220,12 +217,90 @@ func (p *processor) Process(ctx context.Context, tx db.DB, upload db.Upload) (er
 		return errors.Wrap(err, "updateCommitsAndVisibility")
 	}
 
+	newFilename := filepath.Join(name, "yay")
+	badgerFile := filepath.Join(name, "badger")
+	f, err := os.Create(newFilename)
+	if err != nil {
+		return err
+	}
+
+	if err := Tar(badgerFile, f); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+
 	// Send converted database file to bundle manager
 	if err := p.bundleManagerClient.SendDB(ctx, upload.ID, newFilename); err != nil {
 		return errors.Wrap(err, "bundleManager.SendDB")
 	}
 
 	return nil
+}
+
+// Tar takes a source and variable writers and walks 'source' writing each file
+// found to the tar writer; the purpose for accepting multiple writers is to allow
+// for multiple outputs (for example a file, or md5 hash)
+func Tar(src string, writers ...io.Writer) error {
+	// ensure the src actually exists before trying to tar it
+	if _, err := os.Stat(src); err != nil {
+		return fmt.Errorf("Unable to tar files - %v", err.Error())
+	}
+
+	mw := io.MultiWriter(writers...)
+
+	gzw := gzip.NewWriter(mw)
+	defer gzw.Close()
+
+	tw := tar.NewWriter(gzw)
+	defer tw.Close()
+
+	// walk path
+	return filepath.Walk(src, func(file string, fi os.FileInfo, err error) error {
+
+		// return on any error
+		if err != nil {
+			return err
+		}
+
+		// return on non-regular files (thanks to [kumo](https://medium.com/@komuw/just-like-you-did-fbdd7df829d3) for this suggested update)
+		if !fi.Mode().IsRegular() {
+			return nil
+		}
+
+		// create a new dir/file header
+		header, err := tar.FileInfoHeader(fi, fi.Name())
+		if err != nil {
+			return err
+		}
+
+		// update the name to correctly reflect the desired destination when untaring
+		header.Name = strings.TrimPrefix(strings.Replace(file, src, "", -1), string(filepath.Separator))
+
+		// write the header
+		if err := tw.WriteHeader(header); err != nil {
+			return err
+		}
+
+		// open files for taring
+		f, err := os.Open(file)
+		if err != nil {
+			return err
+		}
+
+		// copy file data into tar writer
+		if _, err := io.Copy(tw, f); err != nil {
+			return err
+		}
+
+		// manually close here after each file operation; defering would cause each file close
+		// to wait until all operations have completed.
+		f.Close()
+
+		return nil
+	})
 }
 
 // updateCommits updates the lsif_commits table with the current data known to gitserver, then updates the
@@ -270,7 +345,7 @@ func (p *processor) updateCommitsAndVisibility(ctx context.Context, db db.DB, re
 func convert(
 	ctx context.Context,
 	filename string,
-	newFilename string,
+	dirname string,
 	dumpID int,
 	root string,
 	getChildren existence.GetChildrenFunc,
@@ -280,7 +355,7 @@ func convert(
 		return nil, nil, errors.Wrap(err, "correlation.Correlate")
 	}
 
-	if err := write(ctx, newFilename, groupedBundleData); err != nil {
+	if err := write(ctx, dirname, groupedBundleData); err != nil {
 		return nil, nil, err
 	}
 
@@ -288,8 +363,23 @@ func convert(
 }
 
 // write commits the correlated data to disk.
-func write(ctx context.Context, filename string, groupedBundleData *correlation.GroupedBundleData) error {
-	writer, err := writer.NewSQLiteWriter(filename, jsonserializer.New())
+func write(ctx context.Context, dirname string, groupedBundleData *correlation.GroupedBundleData) error {
+	// // Create target file for converted database
+	// uuid, err := uuid.NewRandom()
+	// if err != nil {
+	// 	return err
+	// }
+	// newFilename := filepath.Join(name, uuid.String())
+
+	// writer, err := writer.NewSQLiteWriter(dirname, jsonserializer.New())
+	// if err != nil {
+	// 	return err
+	// }
+	realDirname := filepath.Join(dirname, "badger")
+	if err := os.Mkdir(realDirname, os.ModePerm); err != nil {
+		return err
+	}
+	writer, err := writer.NewBadgerWriter(realDirname, jsonserializer.New())
 	if err != nil {
 		return err
 	}

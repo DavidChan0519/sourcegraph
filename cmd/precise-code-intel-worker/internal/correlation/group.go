@@ -198,6 +198,8 @@ func gatherMonikersByResult(state *State, data map[string]datastructures.Default
 		}
 	}
 
+	uniques := map[string]struct{}{}
+
 	for id, documentRanges := range data {
 		monikerIDs, ok := monikers[id]
 		if !ok {
@@ -216,6 +218,15 @@ func gatherMonikersByResult(state *State, data map[string]datastructures.Default
 
 				for id := range rangeIDs {
 					r := state.RangeData[id]
+
+					// TODO - that's so dumb
+					// fmt.Sprintf("%d", r.EndLine), fmt.Sprintf("%d", r.EndCharacter)
+					key := strings.Join([]string{moniker.Scheme, moniker.Identifier, document.URI, fmt.Sprintf("%d", r.StartLine), fmt.Sprintf("%d", r.StartCharacter)}, ":")
+					if _, ok := uniques[key]; ok {
+						fmt.Printf("OOOF\n")
+						continue
+					}
+					uniques[key] = struct{}{}
 
 					rows = append(rows, types.DefinitionReferenceRow{
 						Scheme:         moniker.Scheme,
